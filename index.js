@@ -1,13 +1,13 @@
 const { fork } = require('child_process');
 const readline = require("readline");
 
-const hostName = "localhost";
-const hostPort = 12345;
+const hostName = "10.20.0.2";
+const hostPort = 25565;
 
 const bots = [];
 const botsByName = {};
 
-const autoSpawnBots = 1;
+const autoSpawnBots = 5;
 const spawnDelay = 5000;
 
 const reader = readline.createInterface({
@@ -16,68 +16,114 @@ const reader = readline.createInterface({
 });
 
 function sleep(time) {
-    return new Promise(resolve=>setTimeout(resolve, time));
+    return new Promise(resolve => setTimeout(resolve, time));
+}
+
+function logWithTimestamp(message) {
+    console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
 function spawnBot(botName) {
-	const bot = fork("bot.js", [botName, hostName, hostPort]);
+    try {
+        const bot = fork("bot.js", [botName, hostName, hostPort]);
 
-	bots.push(bot);
-	botsByName[botName] = bot;
+        bots.push(bot);
+        botsByName[botName] = bot;
 
-	bot.on('message', (data) => {
-		if (data.type === "message") {
-			console.log(`\x1b[32m@${botName}\x1b[0m: ${data.text}`);
-		}
-	});
+        bot.on('message', (data) => {
+            if (data.type === "message") {
+                logWithTimestamp(`\x1b[32m@${botName}\x1b[0m: ${data.text}`);
+            }
+        });
+
+        bot.on('error', (err) => {
+            logWithTimestamp(`Error in bot "${botName}": ${err.message}`);
+        });
+
+        bot.on('exit', () => {
+            logWithTimestamp(`Bot "${botName}" exited.`);
+            // Clean up bot references
+            const index = bots.indexOf(bot);
+            if (index > -1) bots.splice(index, 1);
+            delete botsByName[botName];
+        
+            // Respawn the bot
+            spawnBot(botName);
+        });
+
+        bot.on('end', () => {
+            logWithTimestamp("Bot disconnected. Reconnecting...");
+            setTimeout(() => {
+                bot.reconnect();
+            }, 5000); // Retry connection after 5 seconds
+        });
+        
+    } catch (error) {
+        logWithTimestamp(`Failed to spawn bot "${botName}": ${error.message}`);
+    }
 }
 
-async function spawnBots(amount=1) {
-	for (let i = 0; i < amount; i++) {
-		spawnBot(`guard_${bots.length}`);
+async function monitorBots() {
+    while (true) {
+        for (const bot of bots) {
+            if (bot.killed || bot.exited) {
+                logWithTimestamp(`Bot "${bot.process.pid}" is not active. Restarting...`);
+                bot.kill();
+                spawnBot(bot.process.title);
+            }
+        }
+        await sleep(10000); // Check every 10 seconds
+    }
+}
 
-		await sleep(spawnDelay);
-	}
+// Start the monitoring loop
+monitorBots();
+
+async function spawnBots(amount = 1) {
+    for (let i = 0; i < amount; i++) {
+        spawnBot(`guard_${bots.length}`);
+        await sleep(spawnDelay);
+    }
 }
 
 const COMMAND_FUNCTIONS = {
-	"ping": ()=>{
-		console.log("pong");
-	},
+    "ping": () => {
+        logWithTimestamp("pong");
+    },
 
-	"spawn": (amount)=>{
-		spawnBots(Number(amount));
-	},
+    "spawn": (amount) => {
+        spawnBots(Number(amount));
+    },
 };
 
 function runCommand(command) {
-	const tokens = command.split(' ');
+    const tokens = command.split(' ');
 
-	if (tokens[0].startsWith('@')) {
-		const botName = tokens[0].slice(1);
-		const bot = botsByName[botName];
+    if (tokens[0].startsWith('@')) {
+        const botName = tokens[0].slice(1);
+        const bot = botsByName[botName];
 
-		if (!bot) {
-			console.log(`Couldn't find bot named "${botName}".`);
-			return;
-		}
+        if (!bot) {
+            logWithTimestamp(`Couldn't find bot named "${botName}".`);
+            return;
+        }
 
-		bot.send({
-			type: "command",
-			command: tokens.slice(1),
-		});
+        bot.send({
+            type: "command",
+            command: tokens.slice(1),
+        });
 
-		return;
-	}
+        return;
+    }
 
-	const commandFunction = COMMAND_FUNCTIONS[tokens[0]];
+    const commandFunction = COMMAND_FUNCTIONS[tokens[0]];
 
-	if (!commandFunction) {
-		console.log(`Unknown command: ${tokens[0]}`);
-		return;
-	}
+    if (!commandFunction) {
+        logWithTimestamp(`Unknown command: ${tokens[0]}`);
+        return;
+    }
 
-	commandFunction(...tokens.slice(1));
+    commandFunction(...tokens.slice(1));
 }
 
 function inputLoop(command) {
@@ -86,8 +132,14 @@ function inputLoop(command) {
 }
 
 async function main() {
-	spawnBots(autoSpawnBots);
-	inputLoop();
+    process.on('SIGINT', () => {
+        logWithTimestamp('Shutting down gracefully...');
+        bots.forEach(bot => bot.send({ type: 'command', command: ['stop'] }));
+        process.exit();
+    });
+
+    spawnBots(autoSpawnBots);
+    inputLoop();
 }
 
 main();

@@ -1,0 +1,751 @@
+JavaScript Project Source Code
+==============================
+
+File: .\archery.js
+==============================
+const hawkeye = require('minecrafthawkeye');
+
+function hasArrows(bot) {
+	let arrowItem = bot.registry.itemsByName['arrow'];
+	let arrows = bot.inventory.count(arrowItem.id);
+
+	return arrows > 0;
+}
+
+function hasBow(bot) {
+	let bowItem = bot.registry.itemsByName['bow'];
+	return bot.inventory.count(bowItem.id) > 0;
+}
+
+async function shoot(bot, target) {
+	await bot.hawkEye.oneShot(target, "bow");
+};
+
+module.exports = (bot)=>{
+	bot.loadPlugin(hawkeye.default);
+	bot.archery = {};
+
+	bot.archery.canShoot = ()=>{
+		return hasArrows(bot) && hasBow(bot);
+	};
+
+	bot.archery.hasArrows = ()=>{
+		return hasArrows(bot);
+	};
+
+	bot.archery.hasBow = ()=>{
+		return hasBow(bot);
+	};
+
+	bot.archery.shoot = async (target)=>{
+		await shoot(bot, target);
+	};
+
+	bot.commands.shoot = async (targetName, { log })=>{
+		const target = bot.getEntity(targetName);
+
+		if (target) bot.archery.shoot(target);
+		else log(`Couldn't find ${targetName}.`);
+	};
+};
+
+==============================
+
+File: .\armor.js
+==============================
+// lists of armor items in order of preferences
+const helmets = ["netherite_helmet", "diamond_helmet", "iron_helmet", "golden_helmet", "leather_helmet"];
+const chestplates = ["netherite_chestplate", "diamond_chestplate", "iron_chestplate", "golden_chestplate", "leather_chestplate"];
+const leggings = ["netherite_leggings", "diamond_leggings", "iron_leggings", "golden_leggings", "leather_leggings"];
+const boots = ["netherite_boots", "diamond_boots", "iron_boots", "golden_boots", "leather_boots"];
+
+// FIXME
+async function equipArmorItem(bot, armorList, slot) {
+    let bestIndex;
+
+    for (item of bot.inventory.slots) {
+        if (!item) continue;
+
+        const index = armorList.indexOf(item.name);
+
+        if ((index !== -1) && ((bestIndex === undefined) || (index < bestIndex))) {
+            bestIndex = index;
+        }
+    }
+
+    if (bestIndex !== undefined) {
+        const itemName = armorList[bestIndex];
+        const item = bot.registry.itemsByName[itemName];
+        await bot.equip(item.id, slot).catch(()=>{});
+    }
+}
+
+module.exports = (bot)=>{
+	bot.armor = {};
+
+	bot.armor.equip = async ()=>{
+		await equipArmorItem(bot, helmets, "head");
+        await equipArmorItem(bot, chestplates, "torso");
+        await equipArmorItem(bot, leggings, "legs");
+        await equipArmorItem(bot, boots, "feet");
+	};
+
+    bot.armor.equipFast = async ()=>{
+        await Promise.all([
+            equipArmorItem(bot, helmets, "head"),
+            equipArmorItem(bot, chestplates, "torso"),
+            equipArmorItem(bot, leggings, "legs"),
+            equipArmorItem(bot, boots, "feet"),
+        ]);
+	};
+
+	bot.commands.equiparmor = async ({ log })=>{
+		await bot.armor.equip();
+    };
+
+    bot.on("playerCollect", async (collector, _collected)=>{
+        if (!collector === bot.entity) return;
+
+        await bot.armor.equip();
+    });
+};
+
+==============================
+
+File: .\bot.js
+==============================
+// To resolve the MaxListenersExceededWarning, you can increase the maximum number of listeners or refactor the code to avoid adding too many listeners. In this case, increasing the limit might be a temporary solution:
+require('events').EventEmitter.defaultMaxListeners = 20; // Increase the limit to 20 or higher
+
+const mineflayer = require('mineflayer');
+const fs = require('fs');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
+
+const meleePlugin = require('./melee.js');
+const archeryPlugin = require('./archery.js');
+const armorPlugin = require('./armor.js');
+
+if (process.argv.length < 5) process.exit();
+
+const [botName, hostName, hostPort] = process.argv.slice(2);
+
+const LINE_BREAKS = /\r?\n/g;
+const HUNGER_LIMIT = 5;
+
+const bossList = fs.readFileSync("boss-list.txt", "utf8").split(LINE_BREAKS);
+const targetList = fs.readFileSync("target-list.txt", "utf8").split(LINE_BREAKS);
+
+let defaultMove;
+let guardedPlayer;
+let guarding = true;
+
+function getPathDuration(path) {
+	return path.cost; // TODO: calculate duration of path (in seconds)
+}
+
+const bot = mineflayer.createBot({
+    username: botName,
+    host: hostName,
+    port: hostPort,
+    viewDistance: "tiny",
+});
+
+bot.on('kicked', console.log);
+bot.on('error', console.log);
+
+bot.loadPlugin(pathfinder);
+bot.loadPlugin(meleePlugin);
+bot.loadPlugin(archeryPlugin);
+bot.loadPlugin(armorPlugin);
+
+console.log("Plugins loaded.");
+
+
+bot.getEntity = (name)=>{
+	return bot.nearestEntity((entity)=>{
+		return entity.displayName === name || entity.username === name;
+	});
+}
+
+function findThreat() {
+	return bot.nearestEntity((entity)=>{
+		if (entity.kind !== "Hostile mobs" && !targetList.includes(entity.username)) return false;
+
+		const distanceFromBot = entity.position.distanceTo(bot.entity.position);
+
+		if (distanceFromBot < 8) return true;
+
+		if (!guardedPlayer || !guardedPlayer.entity) return false;
+
+		const distanceFromPlayer = entity.position.distanceTo(guardedPlayer.entity.position);
+
+		if (distanceFromPlayer < 16) return true;
+	});
+}
+
+function findAttacker(position=bot.entity.position) {
+	return bot.nearestEntity((entity)=>{
+		if (bossList.includes(entity.username)) return false;
+
+		const distance = entity.position.distanceTo(position);
+
+		if (distance < 5) return true;
+	});
+}
+
+async function sendGreeting() {
+    try {
+        await bot.chat("I'm a robot.");
+        console.log("Greeting message sent.");
+    } catch (error) {
+        console.error("Error sending greeting message:", error);
+    }
+}
+
+async function attackEnemy(enemy) {
+	const pos = bot.entity.position;
+	const enemyGoal = new goals.GoalNear(pos.x, pos.y, pos.z, 4);
+	const pathToBot = bot.pathfinder.getPathFromTo(defaultMove, enemy.position, enemyGoal);
+
+	let path = pathToBot.next().value.result;
+
+	while (path.status === 'partial') {
+		path = pathToBot.next().value.result;
+	}
+
+	const timeToArrival = getPathDuration(path);
+	const timeToDrawBow = 4;
+
+	if (bot.archery.canShoot() && timeToArrival > timeToDrawBow) {
+		await bot.archery.shoot(enemy);
+	} else {
+		let goal = new goals.GoalFollow(enemy, 4);
+
+		await bot.pathfinder.goto(goal);
+
+		await bot.melee.equip();
+		await bot.melee.punch(enemy);
+	}
+}
+
+async function loop() {
+    if (!guarding) return;
+
+    const enemy = findThreat();
+
+    if (enemy) {
+        await attackEnemy(enemy);
+        return;
+    }
+
+    const randomDistance = Math.floor(Math.random() * (10 - 4 + 1)) + 4; // Random distance between 4 and 10
+    let goal = new goals.GoalFollow(guardedPlayer.entity, randomDistance);
+    await bot.pathfinder.goto(goal);
+}
+
+async function eatFood(log=sendMessage) {
+	if (bot.food === 20) {
+		log(`too full to eat`);
+		return;
+	}
+
+	for (food of bot.registry.foodsArray) {
+		const amount = bot.inventory.count(food.id);
+
+		if (amount === 0) continue;
+
+		log(`found ${amount} ${food.displayName}`);
+		
+		await bot.equip(food.id);
+
+		await bot.consume();
+
+		log(`ate 1 ${food.displayName}`);
+
+		return;
+	}
+
+	log("out of food");
+}
+
+bot.commands = {
+	"continue": async ()=>{
+		guarding = true;
+	},
+
+	"eat": async ({ log })=>{
+		await eatFood(log);
+	},
+
+	"guard": async (username, { log })=>{
+		const player = bot.players[username];
+
+		if (!player) {
+			log(`Player "${username}" does not exist.`);
+			return;
+		}
+
+		guardedPlayer = player;
+	},
+
+	"ping": async ({ log })=>{
+		log("pong");
+	},
+
+	"status": async ({ log })=>{
+		log(`❤${bot.health} 🥕${bot.food}`);
+	},
+
+	"stop": async ({ log })=>{
+		log("Stopping.");
+		bot.pathfinder.setGoal(null);
+		guarding = false;
+	},
+};
+
+async function runCommand(tokens, user, log) {
+	const commandFunction = bot.commands[tokens[0]];
+
+	if (!commandFunction) {
+		log("Unknown command.");
+		return;
+	}
+
+    await commandFunction(...tokens.slice(1), {
+    	user: user,
+		log: log,
+    });
+}
+
+function sendMessage(text) {
+	process.send({
+		type: "message",
+		text: text,
+	});
+}
+
+process.on('message', (data)=>{
+	if (data.type === "command") {
+		runCommand(data.command, user="admin", log=sendMessage);
+		return;
+	}
+
+	console.log(`${botName} recieved unknown message: `, data);
+});
+
+bot.once('spawn', async () => {
+    try {
+        console.log('Bot has spawned.');
+
+        // Function to send commands
+        const sendCommand = (command) => {
+            bot.chat(command);
+            console.log(`Command sent: ${command}`);
+        };
+
+        // Randomize armor and weapon
+        const swords = ['diamond_sword', 'netherite_sword'];
+        const bows = ['bow']; // Assuming basic bow; enchanted bow can be given with enchantment commands
+        const helmets = ['diamond_helmet', 'iron_helmet', 'golden_helmet', 'leather_helmet'];
+        const chestplates = ['diamond_chestplate', 'iron_chestplate', 'golden_chestplate', 'leather_chestplate'];
+        const leggings = ['diamond_leggings', 'iron_leggings', 'golden_leggings', 'leather_leggings'];
+        const boots = ['diamond_boots', 'iron_boots', 'golden_boots', 'leather_boots'];
+
+        const randomItem = (items) => items[Math.floor(Math.random() * items.length)];
+
+        // Randomly choose between Diamond Sword, Netherite Sword, or Enchanted Bow
+        const weaponChoice = randomItem(['diamond_sword', 'netherite_sword', 'enchanted_bow']);
+        if (weaponChoice === 'enchanted_bow') {
+            // Give a bow with random enchantments
+            sendCommand('/give @p bow{Enchantments:[{id:"minecraft:power",lvl:5},{id:"minecraft:infinity",lvl:1}]}');
+        } else {
+            sendCommand(`/give @p ${weaponChoice}`);
+        }
+
+        // Give the bot random armor
+        sendCommand(`/give @p ${randomItem(helmets)}`);
+        sendCommand(`/give @p ${randomItem(chestplates)}`);
+        sendCommand(`/give @p ${randomItem(leggings)}`);
+        sendCommand(`/give @p ${randomItem(boots)}`);
+
+        // Give the bot essential items
+        sendCommand('/give @p bread 64');            // 64 pieces of bread
+        sendCommand('/give @p apple 64');            // 64 apples
+        sendCommand('/give @p cooked_beef 64');      // 64 pieces of cooked beef
+        sendCommand('/give @p golden_carrot 64');    // 64 golden carrots
+        sendCommand('/give @p steak 64');            // 64 pieces of steak
+        sendCommand('/give @p porkchop 64');         // 64 pieces of porkchop
+        sendCommand('/give @p chicken 64');          // 64 pieces of raw chicken
+        sendCommand('/give @p cooked_chicken 64');   // 64 pieces of cooked chicken
+        sendCommand('/give @p mutton 64');           // 64 pieces of mutton
+        sendCommand('/give @p cooked_mutton 64');    // 64 pieces of cooked mutton
+
+        // Additional useful items
+        sendCommand('/give @p torches 64');           // 64 torches for lighting
+        sendCommand('/give @p wood 64');              // 64 pieces of wood for crafting
+        sendCommand('/give @p cobblestone 64');       // 64 pieces of cobblestone for building
+        sendCommand('/give @p coal 64');              // 64 pieces of coal for smelting and lighting
+        sendCommand('/give @p iron_ingot 64');        // 64 iron ingots for crafting tools
+        sendCommand('/give @p gold_ingot 64');        // 64 gold ingots for crafting and trading
+        sendCommand('/give @p redstone 64');          // 64 redstones for crafting and machines
+        sendCommand('/give @p gunpowder 64');         // 64 gunpowder for crafting TNT and fireworks
+        sendCommand('/give @p string 64');            // 64 string for crafting bows and wool
+        sendCommand('/give @p ender_pearl 16');       // 16 ender pearls for teleportation
+        sendCommand('/give @p blaze_powder 16');      // 16 blaze powders for brewing and eye of ender
+        sendCommand('/give @p emerald 16');           // 16 emeralds for trading and crafting
+
+        // Greeting message
+        bot.chat("I'm a robot.");
+        console.log('Greeting message sent.');
+
+        await sendGreeting();
+
+        // Set up default movement
+        defaultMove = new Movements(bot);
+        bot.pathfinder.setMovements(defaultMove);
+        console.log('Default movement setup.');
+
+        // Find a boss
+        console.log('Searching for a boss...');
+        while (true) {
+            let foundBoss = bot.nearestEntity((entity) => {
+                return bossList.includes(entity.username);
+            });
+
+            if (foundBoss) {
+                guardedPlayer = bot.players[foundBoss.username];
+                console.log(`Boss found: ${foundBoss.username}`);
+                break;
+            }
+
+            const enemy = findThreat();
+            if (enemy) {
+                console.log(`Threat found: ${enemy.username}`);
+                await attackEnemy(enemy);
+            }
+
+            await bot.waitForTicks(5);
+        }
+
+        // Protect the boss
+        console.log('Entering boss protection loop...');
+        while (true) {
+            await bot.waitForTicks(1);
+            await loop();
+        }
+    } catch (error) {
+        console.error('Error in spawn event handler:', error);
+    }
+});
+
+bot.on("chat", async (username, message)=>{
+	if (!bossList.includes(username)) return;
+
+	const tokens = message.split(' ');
+
+	await runCommand(tokens, user=username, log=bot.chat);
+});
+
+bot.on("whisper", async (username, message)=>{
+	if (!bossList.includes(username)) return;
+
+	const tokens = message.split(' ');
+
+	await runCommand(tokens, user=username, log=(text)=>bot.whisper(username, text));
+});
+
+bot.on("health", async ()=>{
+	if (bot.food > HUNGER_LIMIT) return;
+
+	sendMessage(`hunger has reached ${bot.food}!`);
+
+	await eatFood();
+});
+
+bot.on("entityGone", (entity)=>{
+	const targetIndex = targetList.indexOf(entity.username);
+
+	if (targetIndex === -1) return;
+	
+	targetList.splice(targetIndex, 1);
+});
+
+bot.on("entityHurt", (entity)=>{
+	let attacked = false;
+
+	if (entity === bot.entity) attacked = true;
+
+	if (guardedPlayer && guardedPlayer.entity) {
+		if (entity === guardedPlayer.entity) attacked = true;
+	}
+
+	if (attacked) {
+		sendMessage(`${entity.username} was hurt!`);
+
+		const attacker = findAttacker(bot.entity.position);
+
+		if (attacker && !targetList.includes(attacker.username)) {
+			targetList.push(attacker.username);
+		}
+	}
+});
+
+
+==============================
+
+File: .\console-colors.js
+==============================
+// Some of these are wrong.
+
+module.exports = {
+    RESET: '\x1b[0m',
+    
+    cyan: '\x1b[36m%s\x1b[0m',
+    purple: '\x1b[35m%s\x1b[0m',
+    blue: '\x1b[34m%s\x1b[0m',
+    yellow: '\x1b[33m%s\x1b[0m',
+    green: '\x1b[32m%s\x1b[0m',
+    red: '\x1b[31m%s\x1b[0m',
+    gray: '\x1b[90m%s\x1b[0m',
+    magenta: '\x1b[95m%s\x1b[0m',
+    pink: '\x1b[95m%s\x1b[0m',
+    orange: '\x1b[33m%s\x1b[0m',
+    white: '\x1b[37m%s\x1b[0m',
+    black: '\x1b[30m%s\x1b[0m',
+    brightRed: '\x1b[91m%s\x1b[0m',
+    brightGreen: '\x1b[92m%s\x1b[0m',
+    brightYellow: '\x1b[93m%s\x1b[0m',
+    brightBlue: '\x1b[94m%s\x1b[0m',
+    brightMagenta: '\x1b[95m%s\x1b[0m',
+    brightCyan: '\x1b[96m%s\x1b[0m',
+    brightWhite: '\x1b[97m%s\x1b[0m'
+};
+
+==============================
+
+File: .\index.js
+==============================
+const { fork } = require('child_process');
+const readline = require("readline");
+
+const hostName = "10.20.0.2";
+const hostPort = 25565;
+
+const bots = [];
+const botsByName = {};
+
+const autoSpawnBots = 5;
+const spawnDelay = 5000;
+
+const reader = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+});
+
+function sleep(time) {
+    return new Promise(resolve => setTimeout(resolve, time));
+}
+
+function logWithTimestamp(message) {
+    console.log(`[${new Date().toISOString()}] ${message}`);
+}
+
+function spawnBot(botName) {
+    try {
+        const bot = fork("bot.js", [botName, hostName, hostPort]);
+
+        bots.push(bot);
+        botsByName[botName] = bot;
+
+        bot.on('message', (data) => {
+            if (data.type === "message") {
+                logWithTimestamp(`\x1b[32m@${botName}\x1b[0m: ${data.text}`);
+            }
+        });
+
+        bot.on('error', (err) => {
+            logWithTimestamp(`Error in bot "${botName}": ${err.message}`);
+        });
+
+        bot.on('exit', () => {
+            logWithTimestamp(`Bot "${botName}" exited.`);
+            // Clean up bot references
+            const index = bots.indexOf(bot);
+            if (index > -1) bots.splice(index, 1);
+            delete botsByName[botName];
+        
+            // Respawn the bot
+            spawnBot(botName);
+        });
+
+        bot.on('end', () => {
+            logWithTimestamp("Bot disconnected. Reconnecting...");
+            setTimeout(() => {
+                bot.reconnect();
+            }, 5000); // Retry connection after 5 seconds
+        });
+        
+    } catch (error) {
+        logWithTimestamp(`Failed to spawn bot "${botName}": ${error.message}`);
+    }
+}
+
+async function monitorBots() {
+    while (true) {
+        for (const bot of bots) {
+            if (bot.killed || bot.exited) {
+                logWithTimestamp(`Bot "${bot.process.pid}" is not active. Restarting...`);
+                bot.kill();
+                spawnBot(bot.process.title);
+            }
+        }
+        await sleep(10000); // Check every 10 seconds
+    }
+}
+
+// Start the monitoring loop
+monitorBots();
+
+async function spawnBots(amount = 1) {
+    for (let i = 0; i < amount; i++) {
+        spawnBot(`guard_${bots.length}`);
+        await sleep(spawnDelay);
+    }
+}
+
+const COMMAND_FUNCTIONS = {
+    "ping": () => {
+        logWithTimestamp("pong");
+    },
+
+    "spawn": (amount) => {
+        spawnBots(Number(amount));
+    },
+};
+
+function runCommand(command) {
+    const tokens = command.split(' ');
+
+    if (tokens[0].startsWith('@')) {
+        const botName = tokens[0].slice(1);
+        const bot = botsByName[botName];
+
+        if (!bot) {
+            logWithTimestamp(`Couldn't find bot named "${botName}".`);
+            return;
+        }
+
+        bot.send({
+            type: "command",
+            command: tokens.slice(1),
+        });
+
+        return;
+    }
+
+    const commandFunction = COMMAND_FUNCTIONS[tokens[0]];
+
+    if (!commandFunction) {
+        logWithTimestamp(`Unknown command: ${tokens[0]}`);
+        return;
+    }
+
+    commandFunction(...tokens.slice(1));
+}
+
+function inputLoop(command) {
+    if (command) runCommand(command);
+    reader.question(">", inputLoop);
+}
+
+async function main() {
+    process.on('SIGINT', () => {
+        logWithTimestamp('Shutting down gracefully...');
+        bots.forEach(bot => bot.send({ type: 'command', command: ['stop'] }));
+        process.exit();
+    });
+
+    spawnBots(autoSpawnBots);
+    inputLoop();
+}
+
+main();
+
+
+==============================
+
+File: .\melee.js
+==============================
+// list of weapons in order of preference
+const weaponList = [
+	'netherite_sword',
+	'netherite_axe',
+	'diamond_sword',
+	'diamond_axe',
+	'iron_sword',
+	'iron_axe',
+	'wooden_sword',
+	'wooden_axe',
+	'golden_sword',
+	'golden_axe',
+];
+
+async function equipBestWeapon(bot) {
+	for (itemName of weaponList) {
+		let item = bot.registry.itemsByName[itemName];
+		let hasItem = bot.inventory.count(item.id) > 0;
+		
+		if (hasItem) {
+			await bot.equip(item.id);
+			break;
+		}
+	}
+}
+
+async function punch(bot, target) {
+	if (target) await bot.attack(target);
+}
+
+async function crit(bot, target) {
+	await bot.setControlState("jump", true);
+    await bot.waitForTicks(10);
+
+    if (target) await bot.attack(target);
+
+	await bot.setControlState("jump", false);
+}
+
+module.exports = (bot)=>{
+	bot.melee = {};
+
+	bot.melee.crit = async (target)=>{
+		await crit(bot, target);
+	};
+
+	bot.melee.equip = async ()=>{
+		await equipBestWeapon(bot);
+	};
+
+	bot.melee.punch = async (target)=>{
+		await punch(bot, target);
+	};
+
+	bot.commands.crit = async (targetName, { log })=>{
+		const target = bot.getEntity(targetName);
+		
+		if (target) await bot.combat.crit(target);
+		else log(`Couldn't find ${targetName}.`);
+    };
+
+	bot.commands.equip = bot.melee.equip;
+
+	bot.commands.punch = async (targetName, { log })=>{
+		const target = bot.getEntity(targetName);
+
+		if (target) bot.combat.punch(target);
+		else log(`Couldn't find ${targetName}.`);
+	};
+};
+
+==============================
+
